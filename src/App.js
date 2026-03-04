@@ -131,7 +131,7 @@ const QUICK_Q = [
    AI API 호출
 ═══════════════════════════════════════════ */
 async function callAI(userMsg, systemPrompt) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch("/api/claude", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -217,7 +217,7 @@ export default function App() {
   const fetchTickers = useCallback(async () => {
     setTickerLoading(true);
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("/api/claude", {
         method:"POST",
         headers:{ "Content-Type":"application/json" },
         body: JSON.stringify({
@@ -325,6 +325,73 @@ ${pfContext}
     setAiLoading(false);
   };
 
+  /* ── 현재가 자동 조회 ── */
+  const [priceLoading, setPriceLoading] = useState(false);
+  const [formPriceLoading, setFormPriceLoading] = useState(false);
+
+  const fetchSinglePrice = useCallback(async (name, ticker, market) => {
+    if (!name && !ticker) return;
+    setFormPriceLoading(true);
+    try {
+      const res = await fetch("/api/claude", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({
+          model:"claude-sonnet-4-20250514", max_tokens:200,
+          tools:[{type:"web_search_20250305",name:"web_search"}],
+          messages:[{role:"user", content:
+            `${name}(${ticker||""}) ${market==="US"?"미국주식":"한국주식"} 현재 주가를 검색해서 숫자만 반환하세요. ${market==="US"?"USD 소수점2자리":"KRW 정수"}. 숫자만, 다른 텍스트 없이.`
+          }]
+        })
+      });
+      const data = await res.json();
+      const text = data.content?.map(b=>b.text||"").join("")||"";
+      const match = text.match(/[\d,]+\.?\d*/);
+      if (match) {
+        const price = parseFloat(match[0].replace(/,/g,""));
+        if (price > 0) setForm(f=>({...f, currentPrice: market==="US"?+price.toFixed(2):Math.round(price)}));
+      }
+    } catch(e) { console.warn(e); }
+    setFormPriceLoading(false);
+  }, []);
+
+  const refreshAllPrices = useCallback(async () => {
+    if (stocks.length===0) return;
+    setPriceLoading(true);
+    try {
+      // 1) 환율 먼저
+      const fxRes = await fetch("/api/claude",{
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:80,tools:[{type:"web_search_20250305",name:"web_search"}],
+          messages:[{role:"user",content:"현재 USD/KRW 환율 숫자만. 예: 1372.50"}]})
+      });
+      const fxData = await fxRes.json();
+      const fxTxt = fxData.content?.map(b=>b.text||"").join("")||"";
+      const fxM = fxTxt.match(/[\d,]+\.?\d*/);
+      if(fxM){const fx=parseFloat(fxM[0].replace(/,/g,""));if(fx>900&&fx<2000)setUsdKrw(Math.round(fx));}
+
+      // 2) 종목 가격 일괄
+      const list = stocks.map(s=>`${s.name}(티커:${s.ticker||s.name},${s.market==="US"?"미국":"한국"})`).join(", ");
+      const res = await fetch("/api/claude",{
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:600,tools:[{type:"web_search_20250305",name:"web_search"}],
+          messages:[{role:"user",content:`다음 종목 현재 주가를 검색해서 JSON 배열만 반환. 다른 텍스트 없이:\n${list}\n형식:[{"ticker":"코드","price":숫자},...] 미국은 USD소수점2자리, 한국은 KRW정수.`}]})
+      });
+      const data = await res.json();
+      const text = data.content?.map(b=>b.text||"").join("")||"";
+      const match = text.match(/\[[\s\S]*\]/);
+      if(match){
+        const parsed = JSON.parse(match[0]);
+        if(Array.isArray(parsed)){
+          persist(stocks.map(s=>{
+            const found=parsed.find(p=>p.ticker===s.ticker||p.ticker===s.name);
+            return (found&&found.price>0)?{...s,currentPrice:s.market==="US"?+Number(found.price).toFixed(2):Math.round(found.price)}:s;
+          }));
+        }
+      }
+    } catch(e){console.warn(e);}
+    setPriceLoading(false);
+  }, [stocks, persist]);
+
   /* ── 종목 CRUD ── */
   const openAdd = () => {
     setForm({ name:"", ticker:"", market:"KR", currentPrice:"", avgPrice:"", qty:"" });
@@ -336,7 +403,8 @@ ${pfContext}
     setStockModal(s);
   };
   const saveStock = () => {
-    if (!form.name||!form.currentPrice) return;
+    if (!form.name) return;
+    if (!form.currentPrice && !form.avgPrice) return;
     if (stockModal==="add") {
       // 평단가+수량으로 trade 생성
       const trades = (form.avgPrice && form.qty)
@@ -354,7 +422,7 @@ ${pfContext}
     }
     setStockModal(null);
   };
-  const delStock = (id) => { if(window.confirm("이 종목을 삭제할까요?")) persist(stocks.filter(s=>s.id!==id)); };
+  const delStock = (id) => { persist(stocks.filter(s=>s.id!==id)); };
 
   const saveTrade = () => {
     if (!tForm.date||!tForm.qty||!tForm.price) return;
@@ -434,9 +502,15 @@ ${pfContext}
           <span style={{ fontSize:15, fontWeight:700, letterSpacing:-.5 }}>포트폴리오 트래커</span>
           {lastUpdated && <span style={{ fontSize:9, color:"#445", marginLeft:2 }}>{lastUpdated}</span>}
           {/* 환율 표시 */}
-          <button onClick={()=>setShowFx(v=>!v)} style={{ marginLeft:"auto", background:"rgba(255,211,0,.08)", border:"1px solid rgba(255,211,0,.2)", borderRadius:8, padding:"4px 10px", fontSize:11, color:C.accent, cursor:"pointer", fontFamily:"inherit" }}>
-            💱 {usdKrw.toLocaleString()}
-          </button>
+          <div style={{ marginLeft:"auto", display:"flex", gap:6, alignItems:"center" }}>
+            <button onClick={refreshAllPrices} disabled={priceLoading}
+              style={{ background:"rgba(52,211,153,.1)", border:"1px solid rgba(52,211,153,.25)", borderRadius:8, padding:"4px 10px", fontSize:11, color:priceLoading?"#445":"#34D399", cursor:"pointer", fontFamily:"inherit", display:"flex", alignItems:"center", gap:4 }}>
+              {priceLoading ? "⟳" : "🔄"}{priceLoading ? " 조회중..." : " 시세갱신"}
+            </button>
+            <button onClick={()=>setShowFx(v=>!v)} style={{ background:"rgba(255,211,0,.08)", border:"1px solid rgba(255,211,0,.2)", borderRadius:8, padding:"4px 10px", fontSize:11, color:C.accent, cursor:"pointer", fontFamily:"inherit" }}>
+              💱 {usdKrw.toLocaleString()}
+            </button>
+          </div>
         </div>
         {/* 환율 입력 (토글) */}
         {showFx && (
@@ -494,6 +568,10 @@ ${pfContext}
                 ].map(([l,v])=>(
                   <div key={l}><div style={{ fontSize:10, color:"#334", marginBottom:2 }}>{l}</div><div style={{ fontSize:12, color:"#778" }}>{v}</div></div>
                 ))}
+                <button onClick={refreshAllPrices} disabled={priceLoading}
+                  style={{ marginLeft:"auto", alignSelf:"flex-end", background: priceLoading?"rgba(255,255,255,.04)":"rgba(52,211,153,.1)", border:"1px solid rgba(52,211,153,.3)", borderRadius:8, padding:"5px 12px", fontSize:11, color: priceLoading?"#556":"#34D399", cursor:"pointer", fontFamily:"inherit", flexShrink:0, whiteSpace:"nowrap" }}>
+                  {priceLoading ? "⟳ 업데이트 중..." : "💰 현재가 업데이트"}
+                </button>
               </div>
             </div>
 
@@ -951,8 +1029,15 @@ ${pfContext}
                 </div>
               </div>
               <div>
-                <div style={{ fontSize:12, color:C.muted, marginBottom:6 }}>현재가 * <span style={{ color:"#445" }}>(최근 체결가, {form.market==="US"?"$":"₩"})</span></div>
-                <input style={inp} type="number" inputMode="decimal" placeholder={form.market==="US"?"예: 213.20":"예: 74500"} value={form.currentPrice} onChange={e=>setForm(f=>({...f,currentPrice:e.target.value}))}/>
+                <div style={{ fontSize:12, color:C.muted, marginBottom:6, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                  <span>현재가 <span style={{ color:"#445" }}>({form.market==="US"?"$":"₩"})</span></span>
+                  <button onClick={()=>fetchSinglePrice(form.name,form.ticker,form.market)} disabled={formPriceLoading||(!form.name&&!form.ticker)}
+                    style={{ background:"rgba(52,211,153,.12)", border:"1px solid rgba(52,211,153,.3)", borderRadius:6, padding:"3px 10px", fontSize:11, color:formPriceLoading?"#445":"#34D399", cursor:"pointer", fontFamily:"inherit" }}>
+                    {formPriceLoading?"검색중...":"🔍 자동검색"}
+                  </button>
+                </div>
+                <input style={{...inp, borderColor: form.currentPrice?"rgba(52,211,153,.4)":"rgba(255,211,0,.2)"}} type="number" inputMode="decimal" placeholder={form.market==="US"?"예: 213.20 (자동검색 가능)":"예: 74500 (자동검색 가능)"} value={form.currentPrice} onChange={e=>setForm(f=>({...f,currentPrice:e.target.value}))}/>
+                {form.currentPrice && <div style={{ fontSize:10, color:"#34D399", marginTop:4 }}>✓ {form.market==="US"?"$"+Number(form.currentPrice).toFixed(2):"₩"+Number(form.currentPrice).toLocaleString("ko-KR")}</div>}
               </div>
             </div>
             <div style={{ display:"flex", gap:10, marginTop:18 }}>
